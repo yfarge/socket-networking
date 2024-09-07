@@ -1,85 +1,96 @@
-from typing import Dict
+from typing import Dict, Optional
 from urllib.parse import urlparse
 from argparse import ArgumentParser
 import socket
 import sys
 
 parser = ArgumentParser(
-    prog='curl-clone', description='Implements the GET method')
+    prog='a simple curl clone', description='Implements the GET method')
 
 parser.add_argument('url')
 args = parser.parse_args()
 
-CRLF = '\r\n\r\n'
-REDIRECT_LIMIT = 10
-CHUNK_SIZE = 4096
+MAXMIMUM_REDIRECTS = 10
 
 
-def parse_headers(headers: str) -> ((str, int, str), Dict[str, str]):
-    lines = headers.splitlines()
-    status_code = int(lines[0].split(' ', 2)[1])
+def parse_headers(headers: str) -> (int, Dict[str, str]):
+    header_lines = headers.splitlines()
+    status_code = int(header_lines[0].split(' ', 2)[1])
 
-    headers = {}
-    for line in lines[1:]:
-        key, value = line.split(':', 1)
-        headers[key] = value.strip()
+    header_dict = {}
+    for line in header_lines[1:]:
+        if ':' in line:
+            key, value = line.split(':', 1)
+            header_dict[key.strip()] = value.strip()
 
-    return (status_code, headers)
+    return status_code, header_dict
 
 
-def receive_data(socket: socket.socket) -> str:
-    chunks = []
+def receive_response(sock: socket.socket) -> str:
+    response = b''
     while True:
-        chunk = socket.recv(CHUNK_SIZE)
-        if chunk:
-            chunks.append(chunk.decode())
-        else:
+        data = sock.recv(1024)
+        if not data:
             break
+        response += data
 
-    return "".join(chunks)
-
-
-def GET(url: str):
-    redirects = REDIRECT_LIMIT
-    while redirects:
-        url = urlparse(url)
-        if url.scheme != 'http':
-            print(f"This client is http only: your request is {
-                  url.scheme}.", file=sys.stderr)
-            return -1
-
-        with socket.create_connection((url.hostname, url.port or 80)) as s:
-            # Format Request
-            msg = 'GET {0} HTTP/1.0\r\nHost: {1}{2}'
-            msg = msg.format(url.path or '/', url.hostname, CRLF)
-
-            # Send Request
-            s.sendall(bytes(msg, "UTF-8"))
-
-            # Receive Data
-            data = receive_data(s)
-
-            # Format Response
-            headers, body = data.split(CRLF)
-            status_code, headers = parse_headers(headers)
-
-            # Do not process request if not 'text/html'
-            if not headers["Content-Type"].startswith('text/html'):
-                return -1
-
-            # Process Response
-            match status_code:
-                case 200:
-                    print(body)
-                    return 0
-                case status_code if status_code == 301 or status_code == 302:
-                    url = headers["Location"]
-                    redirects -= 1
-                    print(f'Redirected to: {url}', file=sys.stderr)
-                case status_code if status_code >= 400:
-                    print(body)
-                    return -1
-    return -1
+    return response.decode('ascii')
 
 
-GET(args.url)
+def send_request(host: str, port: int, request: str) -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((host, port))
+        s.sendall(request.encode('ascii'))
+        response = receive_response(s)
+
+    return response
+
+
+def fetch_url(url: str) -> Optional[str]:
+    parsed_url = urlparse(url)
+
+    host = parsed_url.hostname
+    port = parsed_url.port or 80
+    netloc = parsed_url.netloc
+    path = parsed_url.path or '/'
+    scheme = parsed_url.scheme
+
+    if scheme != 'http':
+        print(f"This client only supports HTTP: {scheme}", file=sys.stderr)
+        sys.exit(1)
+
+    request = f'GET {path} HTTP/1.0\r\n'
+    request += f'Host: {netloc}\r\n\r\n'
+    response = send_request(host, port, request)
+    headers, body = response.split("\r\n\r\n")
+    status_code, header_dict = parse_headers(headers)
+
+    content_type = header_dict.get('Content-Type')
+    if content_type and not content_type.startswith('text/html'):
+        print("This client only supports 'text/html'", file=sys.stderr)
+        sys.exit(1)
+
+    match status_code:
+        case 200:
+            print(body)
+            sys.exit(0)
+        case status_code if status_code in (301, 302):
+            if 'Location' in header_dict:
+                redirect_url = header_dict.get('Location')
+                print(f"Redirected to {redirect_url}")
+                return redirect_url
+        case status_code if status_code >= 400:
+            print(body)
+            sys.exit(1)
+
+
+def get(url: str):
+    redirect_count = MAXMIMUM_REDIRECTS
+    while redirect_count:
+        url = fetch_url(url)
+        redirect_count -= 1
+    print("Maximum number of redirects reached.", file=sys.stderr)
+    sys.exit(1)
+
+
+get(args.url)
